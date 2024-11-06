@@ -1,0 +1,1167 @@
+import socket
+import threading
+import base64
+import json
+import os
+import sys
+import hashlib
+import ssl
+from urllib.parse import urlparse
+import time
+import zlib
+from urllib.parse import urlparse
+from datetime import datetime
+from collections import defaultdict
+import logging
+from typing import Dict, List, Tuple, Optional
+import queue
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime
+
+    #  New GUI features  -----------------------------------------------------------------------------
+    #  Tkinter is a built-in Python standard library, so you don't have to download anything extra
+class PseudoGitGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("PseudoGit GUI")
+        self.root.geometry("800x600")
+        
+        # Create queues for thread-safe communication
+        self.message_queue = queue.Queue()
+        self.progress_queue = queue.Queue()
+        
+        # Track active operations
+        self.active_operation = False
+        
+        self._create_gui()
+        self._setup_periodic_updates()
+
+    def _create_gui(self):
+        """Create the main GUI elements"""
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Repository frame
+        repo_frame = ttk.LabelFrame(main_frame, text="Repository Details", padding="5")
+        repo_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Label(repo_frame, text="Repository:").grid(row=0, column=0, padx=5)
+        self.repo_entry = ttk.Entry(repo_frame, width=40)
+        self.repo_entry.grid(row=0, column=1, padx=5)
+        ttk.Label(repo_frame, text="(e.g., username/repository)").grid(row=0, column=2, padx=5)
+        
+        ttk.Label(repo_frame, text="Branch:").grid(row=1, column=0, padx=5)
+        self.branch_entry = ttk.Entry(repo_frame, width=40)
+        self.branch_entry.grid(row=1, column=1, padx=5)
+        self.branch_entry.insert(0, "main")
+        
+        # Operations frame
+        op_frame = ttk.LabelFrame(main_frame, text="Operations", padding="5")
+        op_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
+        
+        # Clone frame
+        clone_frame = ttk.Frame(op_frame)
+        clone_frame.grid(row=0, column=0, pady=5)
+        
+        ttk.Label(clone_frame, text="Parallel Downloads:").grid(row=0, column=0, padx=5)
+        self.parallel_var = tk.StringVar(value="4")
+        parallel_spin = ttk.Spinbox(clone_frame, from_=1, to=8, width=5, textvariable=self.parallel_var)
+        parallel_spin.grid(row=0, column=1, padx=5)
+        
+        ttk.Button(clone_frame, text="Clone Repository", 
+                  command=self._start_clone).grid(row=0, column=2, padx=5)
+        
+        # Upload frame
+        upload_frame = ttk.Frame(op_frame)
+        upload_frame.grid(row=1, column=0, pady=5)
+        
+        self.file_path = tk.StringVar()
+        ttk.Label(upload_frame, text="File:").grid(row=0, column=0, padx=5)
+        ttk.Entry(upload_frame, textvariable=self.file_path, width=40).grid(row=0, column=1, padx=5)
+        ttk.Button(upload_frame, text="Browse", 
+                  command=self._browse_file).grid(row=0, column=2, padx=5)
+        ttk.Button(upload_frame, text="Upload File", 
+                  command=self._start_upload).grid(row=0, column=3, padx=5)
+        
+        # Pull Request frame
+        pr_frame = ttk.Frame(op_frame)
+        pr_frame.grid(row=2, column=0, pady=5)
+        
+        ttk.Button(pr_frame, text="Create PR", 
+                  command=self._create_pr).grid(row=0, column=0, padx=5)
+        ttk.Button(pr_frame, text="List PRs", 
+                  command=self._list_prs).grid(row=0, column=1, padx=5)
+        
+        # Progress frame
+        progress_frame = ttk.LabelFrame(main_frame, text="Progress", padding="5")
+        progress_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate', 
+                                          variable=self.progress_var)
+        self.progress_bar.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=5, pady=5)
+        
+        # Log frame
+        log_frame = ttk.LabelFrame(main_frame, text="Log", padding="5")
+        log_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        self.log_text = tk.Text(log_frame, height=10, width=70)
+        self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        
+        # Configure grid weights
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(3, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+
+    def _setup_periodic_updates(self):
+        """Setup periodic GUI updates"""
+        def update_gui():
+            # Process any pending messages
+            while True:
+                try:
+                    message = self.message_queue.get_nowait()
+                    self._append_log(message)
+                except queue.Empty:
+                    break
+                    
+            # Process progress updates
+            while True:
+                try:
+                    progress = self.progress_queue.get_nowait()
+                    self.progress_var.set(progress)
+                except queue.Empty:
+                    break
+                    
+            # Schedule next update
+            self.root.after(100, update_gui)
+            
+        update_gui()
+
+    def _append_log(self, message: str):
+        """Append message to log with timestamp"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.see(tk.END)
+
+    def _browse_file(self):
+        """Open file browser dialog"""
+        filename = filedialog.askopenfilename()
+        if filename:
+            self.file_path.set(filename)
+
+    def _validate_inputs(self) -> bool:
+        """Validate required inputs"""
+        if not self.repo_entry.get():
+            messagebox.showerror("Error", "Please enter a repository name")
+            return False
+        if not self.branch_entry.get():
+            messagebox.showerror("Error", "Please enter a branch name")
+            return False
+        return True
+
+    def _start_operation(self, operation):
+        """Start a background operation"""
+        if self.active_operation:
+            messagebox.showerror("Error", "An operation is already in progress")
+            return False
+        
+        if not self._validate_inputs():
+            return False
+            
+        self.active_operation = True
+        self.progress_var.set(0)
+        return True
+
+    def _end_operation(self):
+        """End the current operation"""
+        self.active_operation = False
+        self.progress_var.set(100)
+
+    def _start_clone(self):
+        """Start clone operation"""
+        if not self._start_operation("clone"):
+            return
+            
+        def clone_thread():
+            try:
+                from PseudoGit import PseudoGit
+                
+                client = PseudoGit(
+                    command="clone",
+                    repository=self.repo_entry.get(),
+                    branch=self.branch_entry.get(),
+                    parallel_count=self.parallel_var.get()
+                )
+                
+                # Override client's print function to use our message queue
+                def custom_print(msg):
+                    self.message_queue.put(str(msg))
+                client._print = custom_print
+                
+                # Start clone operation
+                client.smart_clone()
+                
+                self.message_queue.put("Clone operation completed successfully")
+            except Exception as e:
+                self.message_queue.put(f"Error during clone: {str(e)}")
+            finally:
+                self._end_operation()
+        
+        threading.Thread(target=clone_thread, daemon=True).start()
+
+    def _start_upload(self):
+        """Start upload operation"""
+        if not self._start_operation("upload"):
+            return
+            
+        if not self.file_path.get():
+            messagebox.showerror("Error", "Please select a file to upload")
+            self._end_operation()
+            return
+            
+        def upload_thread():
+            try:
+                from PseudoGit import PseudoGit
+                
+                client = PseudoGit(
+                    command="upload",
+                    repository=self.repo_entry.get(),
+                    branch=self.branch_entry.get(),
+                    file_name=self.file_path.get()
+                )
+                
+                # Override client's print function
+                def custom_print(msg):
+                    self.message_queue.put(str(msg))
+                client._print = custom_print
+                
+                # Start upload operation
+                client.upload()
+                
+                self.message_queue.put("Upload completed successfully")
+            except Exception as e:
+                self.message_queue.put(f"Error during upload: {str(e)}")
+            finally:
+                self._end_operation()
+        
+        threading.Thread(target=upload_thread, daemon=True).start()
+
+    def _create_pr(self):
+        """Create pull request"""
+        if not self._start_operation("create-pr"):
+            return
+            
+        def pr_thread():
+            try:
+                from PseudoGit import PseudoGit
+                
+                client = PseudoGit(
+                    command="create-pr",
+                    repository=self.repo_entry.get(),
+                    branch=self.branch_entry.get()
+                )
+                
+                def custom_print(msg):
+                    self.message_queue.put(str(msg))
+                client._print = custom_print
+                
+                client.create_pr()
+            except Exception as e:
+                self.message_queue.put(f"Error creating PR: {str(e)}")
+            finally:
+                self._end_operation()
+        
+        threading.Thread(target=pr_thread, daemon=True).start()
+
+    def _list_prs(self):
+        """List pull requests"""
+        if not self._start_operation("list-pr"):
+            return
+            
+        def list_thread():
+            try:
+                from PseudoGit import PseudoGit
+                
+                client = PseudoGit(
+                    command="list-pr",
+                    repository=self.repo_entry.get()
+                )
+                
+                def custom_print(msg):
+                    self.message_queue.put(str(msg))
+                client._print = custom_print
+                
+                client.list_pr()
+            except Exception as e:
+                self.message_queue.put(f"Error listing PRs: {str(e)}")
+            finally:
+                self._end_operation()
+        
+        threading.Thread(target=list_thread, daemon=True).start()
+
+    # New features -----------------------------------------------------------------------------------
+class GitObject:
+    def __init__(self, type_: str, content: bytes):
+        self.type = type_
+        self.content = content
+        self.hash = self._calculate_hash()
+
+    def _calculate_hash(self) -> str:
+        """Calculate SHA-1 hash of the object"""
+        header = f"{self.type} {len(self.content)}".encode()
+        store = header + b'\x00' + self.content
+        return hashlib.sha1(store).hexdigest()
+
+    def serialize(self) -> bytes:
+        """Serialize and compress the object"""
+        header = f"{self.type} {len(self.content)}".encode()
+        store = header + b'\x00' + self.content
+        return zlib.compress(store)
+    
+# Root Code 
+class PseudoGit:
+    GITHUB_API_HOST = "api.github.com"
+    GITHUB_REPO_HOST = "github.com"
+    GITHUB_RAW_HOST = "raw.githubusercontent.com"  
+    GITHUB_API_PORT = 443
+
+    def __init__(self, command, repository, branch=None, file_name=None, pr_number=None, parallel_count=1):
+        self.command = command
+        self.repository = repository
+        self.branch = branch if branch and branch != "None" else "main"
+        self.file_name = file_name
+        self.pr_number = pr_number
+        self.parallel_count = parallel_count
+        self.token = self.load_token()
+        self.headers = self._auth_headers()
+        
+        # New features -----------------------------------------------------------------------------------
+        self.object_store: Dict[str, GitObject] = {}
+        self.download_queue = queue.Queue()
+        self.upload_queue = queue.Queue()
+        self.rate_limit_remaining = float('inf')
+        self.rate_limit_reset = 0
+        self.download_stats = defaultdict(lambda: {'bytes': 0, 'time': 0})
+        
+        # Setup logging
+        self._setup_logging()
+    def _setup_logging(self):
+        """Setup logging configuration"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            handlers=[
+                logging.FileHandler('pseudogit.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def _rate_limit_handler(func):
+        """Decorator to handle GitHub API rate limiting"""
+        def wrapper(self, *args, **kwargs):
+            while True:
+                if self.rate_limit_remaining <= 1:
+                    wait_time = self.rate_limit_reset - time.time()
+                    if wait_time > 0:
+                        self.logger.warning(f"Rate limit reached. Waiting {wait_time:.2f} seconds...")
+                        time.sleep(wait_time)
+                
+                try:
+                    return func(self, *args, **kwargs)
+                except Exception as e:
+                    if "rate limit exceeded" in str(e).lower():
+                        header, _ = self._send_request("GET", "/rate_limit")
+                        self._update_rate_limits(header)
+                        continue
+                    raise
+        return wrapper
+
+    def _update_rate_limits(self, header: str):
+        """Update rate limit information from response headers"""
+        for line in header.split('\r\n'):
+            if line.startswith('X-RateLimit-Remaining:'):
+                self.rate_limit_remaining = int(line.split(': ')[1])
+            elif line.startswith('X-RateLimit-Reset:'):
+                self.rate_limit_reset = int(line.split(': ')[1])
+
+    def _calculate_file_hash(self, file_path: str) -> str:
+        """Calculate SHA-1 hash of a file"""
+        sha1 = hashlib.sha1()
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(8192):
+                sha1.update(chunk)
+        return sha1.hexdigest()
+
+    @_rate_limit_handler
+    def smart_clone(self):
+        """Enhanced clone with parallel processing, progress tracking, and resume capability"""
+        self.logger.info(f"Starting smart clone of repository: {self.repository}")
+        
+        # Get repository structure
+        tree = self._fetch_repository_tree()
+        if not tree:
+            return
+
+        # Create download manifest
+        manifest_file = f"{self.repository.split('/')[-1]}_manifest.json"
+        manifest = self._load_manifest(manifest_file)
+        
+        # Prepare download queue
+        for item in tree:
+            if item['type'] == 'file':
+                file_path = item['path']
+                if not self._should_download(file_path, manifest):
+                    continue
+                self.download_queue.put(item)
+
+        # Start download threads
+        threads = []
+        for _ in range(int(self.parallel_count)):
+            t = threading.Thread(target=self._smart_download_worker)
+            t.daemon = True
+            t.start()
+            threads.append(t)
+
+        # Start progress monitor
+        monitor_thread = threading.Thread(target=self._progress_monitor)
+        monitor_thread.daemon = True
+        monitor_thread.start()
+
+        # Wait for completion
+        self.download_queue.join()
+        
+        # Save final manifest
+        self._save_manifest(manifest_file)
+        
+        # Print statistics
+        self._print_clone_stats()
+
+    def _smart_download_worker(self):
+        """Worker thread for parallel downloads with error handling and retries"""
+        while True:
+            try:
+                item = self.download_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            retries = 3
+            while retries > 0:
+                try:
+                    self._download_with_verification(item)
+                    break
+                except Exception as e:
+                    retries -= 1
+                    if retries == 0:
+                        self.logger.error(f"Failed to download {item['path']}: {e}")
+                    else:
+                        time.sleep(1)
+
+            self.download_queue.task_done()
+
+    def _download_with_verification(self, item: dict):
+        """Download file with integrity verification and better error handling"""
+        start_time = time.time()
+        
+        file_path = item['path']
+        os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else '.', exist_ok=True)
+
+        download_url = item.get('download_url')
+        if not download_url:
+            self.logger.error(f"No download URL for {file_path}")
+            return
+
+        # Download file
+        header, content = self._send_request("GET", download_url)
+        if not content:
+            raise Exception("Download failed - no content received")
+
+        # Convert string content to bytes if necessary
+        if isinstance(content, str):
+            content = content.encode()
+
+        # Calculate hash of the raw content
+        content_hash = hashlib.sha1(content).hexdigest()
+        
+        # Get the expected SHA from the item
+        expected_sha = item.get('sha')
+        
+        # Compare hashes only if expected_sha is provided
+        if expected_sha and content_hash != expected_sha:
+            self.logger.warning(f"Hash mismatch for {file_path}")
+            self.logger.debug(f"Expected: {expected_sha}")
+            self.logger.debug(f"Got: {content_hash}")
+            
+            # Try to get the file content directly from the API
+            api_path = f"/repos/{self.repository}/contents/{file_path}"
+            if self.branch:
+                api_path += f"?ref={self.branch}"
+            
+            header, api_response = self._send_request("GET", api_path)
+            
+            if api_response:
+                try:
+                    if isinstance(api_response, bytes):
+                        api_response = api_response.decode()
+                        
+                    file_data = json.loads(api_response)
+                    if file_data.get('content'):
+                        content = base64.b64decode(file_data['content'])
+                        content_hash = hashlib.sha1(content).hexdigest()
+                        
+                        if content_hash == expected_sha:
+                            self.logger.info(f"Successfully retrieved correct content for {file_path} via API")
+                        else:
+                            self.logger.warning(f"Hash still mismatches after API retrieval for {file_path}")
+                except Exception as e:
+                    self.logger.error(f"Error retrieving file via API: {e}")
+
+        # Save file
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(content)
+        except Exception as e:
+            self.logger.error(f"Error saving file {file_path}: {e}")
+            raise
+
+        # Update statistics
+        elapsed = time.time() - start_time
+        self.download_stats[file_path] = {
+            'bytes': len(content),
+            'time': elapsed
+        }
+
+    def _progress_monitor(self):
+        """Monitor and display download progress"""
+        total_files = self.download_queue.qsize()
+        downloaded_files = 0
+        last_update = time.time()
+
+        while downloaded_files < total_files:
+            current_size = self.download_queue.qsize()
+            downloaded_files = total_files - current_size
+            
+            if time.time() - last_update >= 1:  # Update every second
+                speed = sum(s['bytes'] for s in self.download_stats.values()) / \
+                       max(sum(s['time'] for s in self.download_stats.values()), 0.001)
+                
+                sys.stdout.write(f"\rProgress: {downloaded_files}/{total_files} files " + 
+                               f"({downloaded_files/total_files*100:.1f}%) " +
+                               f"Speed: {speed/1024/1024:.2f} MB/s")
+                sys.stdout.flush()
+                last_update = time.time()
+            
+            time.sleep(0.1)
+
+    def _fetch_repository_tree(self) -> List[dict]:
+        """Fetch complete repository tree recursively"""
+        def fetch_tree_recursive(path: str) -> List[dict]:
+            api_path = f"/repos/{self.repository}/contents/{path}"
+            if self.branch:
+                api_path += f"?ref={self.branch}"
+
+            header, body = self._send_request("GET", api_path)
+            if not body:
+                return []
+
+            try:
+                items = json.loads(body) if isinstance(body, str) else json.loads(body.decode())
+                if not isinstance(items, list):
+                    return [items]
+
+                result = []
+                for item in items:
+                    if item['type'] == 'dir':
+                        result.extend(fetch_tree_recursive(item['path']))
+                    else:
+                        result.append(item)
+                return result
+            except Exception as e:
+                self.logger.error(f"Error fetching tree: {e}")
+                return []
+
+        return fetch_tree_recursive("")
+
+    def _load_manifest(self, manifest_file: str) -> Dict:
+        """Load download manifest"""
+        try:
+            with open(manifest_file, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+
+    def _save_manifest(self, manifest_file: str):
+        """Save download manifest"""
+        manifest = {
+            'repository': self.repository,
+            'branch': self.branch,
+            'last_update': datetime.now().isoformat(),
+            'files': {
+                path: {
+                    'hash': self._calculate_file_hash(path),
+                    'size': os.path.getsize(path),
+                    'timestamp': os.path.getmtime(path)
+                }
+                for path in self.download_stats.keys()
+            }
+        }
+        
+        with open(manifest_file, 'w') as f:
+            json.dump(manifest, f, indent=2)
+
+    def _should_download(self, file_path: str, manifest: Dict) -> bool:
+        """Determine if file should be downloaded based on manifest"""
+        if not os.path.exists(file_path):
+            return True
+
+        file_info = manifest.get('files', {}).get(file_path, {})
+        if not file_info:
+            return True
+
+        current_hash = self._calculate_file_hash(file_path)
+        return current_hash != file_info.get('hash')
+
+    def _print_clone_stats(self):
+        """Print clone operation statistics"""
+        total_bytes = sum(s['bytes'] for s in self.download_stats.values())
+        total_time = max(sum(s['time'] for s in self.download_stats.values()), 0.001)
+        avg_speed = total_bytes / total_time
+
+        print("\n\nClone Statistics:")
+        print(f"Total files: {len(self.download_stats)}")
+        print(f"Total data: {total_bytes/1024/1024:.2f} MB")
+        print(f"Total time: {total_time:.2f} seconds")
+        print(f"Average speed: {avg_speed/1024/1024:.2f} MB/s")
+
+    # New features -----------------------------------------------------------------------------------
+    def _get_file_info(self, file_path):
+        """Get local file information"""
+        try:
+            return os.path.exists(file_path), os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        except OSError:
+            return False, 0
+
+    def load_token(self):
+        try:
+            with open("token.txt", "r") as file:
+                return file.read().strip()
+        except FileNotFoundError:
+            print("Error: token.txt file not found. Please create it with your GitHub token.")
+            sys.exit(1)
+
+    def _auth_headers(self):
+        return {
+            "Authorization": f"token {self.token}",
+            "User-Agent": "PseudoGitClient",
+            "Accept": "application/vnd.github.v3+json"
+        }
+
+    def _send_request(self, method, url_or_path, headers=None, body=""):
+        """Enhanced request sending with better error handling and automatic retries"""
+        headers = headers or {}
+        headers.update(self.headers)
+        
+        if url_or_path.startswith('http'):
+            parsed_url = urlparse(url_or_path)
+            host = parsed_url.netloc
+            path = parsed_url.path
+            if parsed_url.query:
+                path += '?' + parsed_url.query
+        else:
+            host = self.GITHUB_API_HOST
+            path = url_or_path if url_or_path.startswith('/') else '/' + url_or_path
+
+        if host == self.GITHUB_RAW_HOST:
+            headers.pop("Authorization", None)
+            headers.pop("Accept", None)
+        
+        headers["Host"] = host
+        
+        if isinstance(body, str):
+            body = body.encode()
+        
+        headers_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
+        request = f"{method} {path} HTTP/1.1\r\n{headers_str}Connection: close\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+        if body:
+            request += body
+
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                raw_socket = socket.create_connection((host, self.GITHUB_API_PORT), timeout=10)
+                context = ssl.create_default_context()
+                sock = context.wrap_socket(raw_socket, server_hostname=host)
+                
+                sock.sendall(request)
+                response = self._receive_response(sock, host == self.GITHUB_RAW_HOST)
+                sock.close()
+                
+                # Check if we got a successful response
+                if response[0] and ('200 OK' in response[0] or '201 Created' in response[0]):
+                    return response
+                    
+                # Check for rate limiting
+                if '403 Forbidden' in response[0] and 'rate limit exceeded' in response[0].lower():
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                        
+                return response
+                
+            except (socket.timeout, ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
+                self.logger.error(f"Connection error after {max_retries} attempts: {e}")
+                return None, None
+            except Exception as e:
+                self.logger.error(f"Unexpected error: {e}")
+                return None, None
+            finally:
+                try:
+                    sock.close()
+                except:
+                    pass
+        
+        return None, None
+            
+    def clone(self):
+        print(f"\nCloning repository: {self.repository}")
+        print(f"Using branch: {self.branch}")
+        
+        api_path = f"/repos/{self.repository}/contents"
+        if self.branch:
+            api_path += f"?ref={self.branch}"
+
+        # Get repository contents
+        header, body = self._send_request("GET", api_path)
+        
+        if not body:
+            return
+            
+        try:
+            files = json.loads(body)
+            if not isinstance(files, list):
+                print(f"Unexpected response format. Expected a list of files.")
+                return
+                
+            print(f"\nFound {len(files)} files to download")
+            for file in files:
+                if 'download_url' in file and file['download_url']:
+                    print(f"\nProcessing {file['name']}...")
+                    if file.get('size', 0) > 1024 * 1024:  # > 1MB
+                        self._download_large_file(file['download_url'], file['name'])
+                    else:
+                        self._download_file(file['download_url'], file['name'])
+                else:
+                    print(f"Skipping {file['name']} (no download URL available)")
+                        
+        except json.JSONDecodeError as e:
+            print(f"Error parsing GitHub response: {e}")
+            return
+        except KeyError as e:
+            print(f"Unexpected response format: {e}")
+            return
+
+    def _download_file(self, url, file_name):
+        print(f"Downloading {file_name}...")
+        header, body = self._send_request("GET", url)
+        if body is None:
+            print(f"Failed to download {file_name}")
+            return
+            
+        try:
+            os.makedirs(os.path.dirname(file_name) if os.path.dirname(file_name) else '.', exist_ok=True)
+            
+            if isinstance(body, str):
+                body = body.encode()
+                
+            with open(file_name, "wb") as file:
+                file.write(body)
+            print(f"Successfully downloaded {file_name}")
+        except Exception as e:
+            print(f"Error saving {file_name}: {e}")
+
+    def _download_large_file(self, url, file_name):
+        file_size = int(self._get_file_size(url))
+        chunk_size = file_size // int(self.parallel_count)
+        threads = []
+
+        os.makedirs(os.path.dirname(file_name) if os.path.dirname(file_name) else '.', exist_ok=True)
+
+        with open(file_name, "wb") as file:
+            file.truncate(file_size)
+
+        for i in range(int(self.parallel_count)):
+            start = i * chunk_size
+            end = start + chunk_size - 1 if i < int(self.parallel_count) - 1 else file_size - 1
+            thread = threading.Thread(target=self._download_chunk, args=(url, file_name, start, end))
+            thread.start()
+            threads.append(thread)
+
+        for thread in threads:
+            thread.join()
+
+    def _receive_response(self, sock, is_binary=False):
+        response = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+        parts = response.split(b"\r\n\r\n", 1)
+        if len(parts) != 2:
+            return response.decode(), b""
+            
+        header, body = parts
+        
+        if is_binary:
+            return header.decode(), body
+        try:
+            return header.decode(), body.decode()
+        except UnicodeDecodeError:
+            return header.decode(), body
+
+    def clone(self):
+        if self.command == "clone" and not self.parallel_count:
+            print("Error: parallel_count is required for clone operation")
+            return
+
+        print(f"\nCloning repository: {self.repository}")
+        print(f"Using branch: {self.branch}")
+        
+        api_path = f"/repos/{self.repository}/contents"
+        if self.branch:
+            api_path += f"?ref={self.branch}"
+
+        header, body = self._send_request("GET", api_path)
+        
+        if not body:
+            return
+            
+        try:
+            if isinstance(body, bytes):
+                files = json.loads(body.decode())
+            else:
+                files = json.loads(body)
+                
+            if not isinstance(files, list):
+                print(f"Unexpected response format. Expected a list of files.")
+                return
+                
+            print(f"\nFound {len(files)} files")
+            for file in files:
+                if 'download_url' in file and file['download_url']:
+                    exists, local_size = self._get_file_info(file['name'])
+                    remote_size = file.get('size', 0)
+                    
+                    if exists and local_size == remote_size:
+                        print(f"Skipping {file['name']} (already up to date)")
+                        continue
+                        
+                    print(f"\nProcessing {file['name']}...")
+                    if remote_size > 1024 * 1024:  # > 1MB
+                        self._download_large_file(file['download_url'], file['name'])
+                    else:
+                        self._download_file(file['download_url'], file['name'])
+                else:
+                    print(f"Skipping {file['name']} (no download URL available)")
+                        
+        except json.JSONDecodeError as e:
+            print(f"Error parsing GitHub response: {e}")
+        except KeyError as e:
+            print(f"Unexpected response format: {e}")
+
+    def _download_chunk(self, url, file_name, start, end):
+        headers = self.headers.copy()
+        headers["Range"] = f"bytes={start}-{end}"
+        
+        print(f"Requesting bytes={start}-{end} for {file_name}")
+        
+        header, body = self._send_request("GET", url, headers)
+        
+        if body is None:
+            print(f"Failed to download chunk {start}-{end} for {file_name}")
+            return
+            
+        if isinstance(body, str):
+            body = body.encode()
+            
+        with open(file_name, "r+b") as file:
+            file.seek(start)
+            file.write(body)
+
+
+    def _get_file_size(self, url):
+        headers = self.headers.copy()
+        headers["Range"] = "bytes=0-0"
+        header, _ = self._send_request("HEAD", url, headers)
+        for line in header.split("\r\n")[1:]:
+            if ": " in line:
+                key, value = line.split(": ", 1)
+                if key.lower() == "content-range":
+                    return int(value.split("/")[1])
+        return 0
+    
+    def branch(self):
+        if not self.branch:
+            print("Error: branch name is required for branch operation")
+            return
+            
+        print(f"Creating new branch: {self.branch}")
+        path = f"/repos/{self.repository}/git/refs/heads/main"
+        header, body = self._send_request("GET", path)
+        if not body:
+            return
+            
+        try:
+            sha = json.loads(body)["object"]["sha"]
+            path = f"/repos/{self.repository}/git/refs"
+            body = json.dumps({"ref": f"refs/heads/{self.branch}", "sha": sha})
+            header, response = self._send_request("POST", path, body=body)
+            if header and "201 Created" in header:
+                print(f"Successfully created branch: {self.branch}")
+            else:
+                print("Failed to create branch")
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Error creating branch: {e}")
+
+    def upload(self):
+        if not self.file_name or not self.branch:
+            print("Error: file_name and branch are required for upload operation")
+            return
+            
+        if not os.path.exists(self.file_name):
+            print(f"Error: File {self.file_name} not found")
+            return
+            
+        print(f"Uploading {self.file_name} to branch: {self.branch}")
+        path = f"/repos/{self.repository}/contents/{self.file_name}"
+        
+        try:
+            # Try to get existing file to get its SHA
+            header, body = self._send_request("GET", f"{path}?ref={self.branch}")
+            file_sha = json.loads(body)["sha"] if body else None
+        except (json.JSONDecodeError, KeyError):
+            file_sha = None
+
+        try:
+            with open(self.file_name, "rb") as file:
+                content = base64.b64encode(file.read()).decode()
+            
+            data = {
+                "message": f"Upload {self.file_name}",
+                "content": content,
+                "branch": self.branch
+            }
+            if file_sha:
+                data["sha"] = file_sha
+                
+            body = json.dumps(data)
+            header, response = self._send_request("PUT", path, body=body)
+            
+            if header and ("201 Created" in header or "200 OK" in header):
+                print(f"Successfully uploaded {self.file_name}")
+            else:
+                print("Failed to upload file")
+        except Exception as e:
+            print(f"Error uploading file: {e}")
+
+    def create_pr(self):
+        if not self.branch:
+            print("Error: branch is required for create-pr operation")
+            return
+            
+        print(f"Creating pull request from {self.branch} to main")
+        path = f"/repos/{self.repository}/pulls"
+        body = json.dumps({
+            "title": "New Pull Request",
+            "body": "Pull request created by PseudoGit",
+            "head": self.branch,
+            "base": "main"
+        })
+        
+        header, response = self._send_request("POST", path, body=body)
+        if header and "201 Created" in header:
+            print("Successfully created pull request")
+        else:
+            print("Failed to create pull request")
+
+    def list_pr(self):
+        print("Listing open pull requests")
+        path = f"/repos/{self.repository}/pulls?state=open"
+        header, body = self._send_request("GET", path)
+        
+        if not body:
+            return
+            
+        try:
+            pulls = json.loads(body)
+            if not pulls:
+                print("No open pull requests found")
+                return
+                
+            for pr in pulls:
+                print(f"PR #{pr['number']}: {pr['title']} (state: {pr['state']})")
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Error listing pull requests: {e}")
+
+    def merge_pr(self):
+        if not self.pr_number:
+            print("Error: pr_number is required for merge-pr operation")
+            return
+            
+        print(f"Merging pull request #{self.pr_number}")
+        path = f"/repos/{self.repository}/pulls/{self.pr_number}/merge"
+        body = json.dumps({
+            "commit_title": f"Merge pull request #{self.pr_number}",
+            "merge_method": "merge"
+        })
+        
+        header, response = self._send_request("PUT", path, body=body)
+        if header and "200 OK" in header:
+            print(f"Successfully merged pull request #{self.pr_number}")
+        else:
+            print("Failed to merge pull request")
+
+def validate_args(args):
+    if len(args) < 3:
+        print("Error: command and repository are required")
+        print("Usage: python PseudoGit.py <command> <repository> [branch] [file_name] [pr_number] [parallel_count]")
+        sys.exit(1)
+        
+    command = args[1]
+    valid_commands = ["clone", "branch", "upload", "create-pr", "list-pr", "merge-pr"]
+    if command not in valid_commands:
+        print(f"Error: Invalid command. Valid commands are: {', '.join(valid_commands)}")
+        sys.exit(1)
+        
+    if command == "clone" and len(args) < 7:
+        print("Error: parallel_count is required for clone operation")
+        sys.exit(1)
+
+# Line based code
+""" """
+
+def validate_args(args):
+    if len(args) < 2:
+        print("Error: Command argument is required")
+        print_usage()
+        sys.exit(1)
+    
+    valid_commands = ['clone', 'branch', 'upload', 'create-pr', 'list-pr', 'merge-pr']
+    command = args[1]
+    
+    if command not in valid_commands:
+        print(f"Error: Invalid command '{command}'")
+        print_usage()
+        sys.exit(1)
+    
+    # Validate required repository argument for all commands
+    if len(args) < 3:
+        print("Error: Repository argument is required")
+        print_usage()
+        sys.exit(1)
+    
+    # Command-specific validation
+    if command == 'clone':
+        if len(args) != 4:
+            print("Error: Clone command requires repository and parallel_count")
+            print_usage()
+            sys.exit(1)
+        try:
+            parallel_count = int(args[3])
+            if parallel_count < 1:
+                raise ValueError
+        except ValueError:
+            print("Error: parallel_count must be a positive integer")
+            sys.exit(1)
+    
+    elif command == 'branch':
+        if len(args) != 4:
+            print("Error: Branch command requires repository and branch name")
+            print_usage()
+            sys.exit(1)
+    
+    elif command == 'upload':
+        if len(args) != 5:
+            print("Error: Upload command requires repository, branch, and file_name")
+            print_usage()
+            sys.exit(1)
+    
+    elif command == 'create-pr':
+        if len(args) != 4:
+            print("Error: Create-pr command requires repository and branch")
+            print_usage()
+            sys.exit(1)
+    
+    elif command == 'merge-pr':
+        if len(args) != 4:
+            print("Error: Merge-pr command requires repository and pr_number")
+            print_usage()
+            sys.exit(1)
+        try:
+            pr_number = int(args[3])
+            if pr_number < 1:
+                raise ValueError
+        except ValueError:
+            print("Error: pr_number must be a positive integer")
+            sys.exit(1)
+
+def print_usage():
+    print("\nUsage:")
+    print("Clone:            python PseudoGit.py clone <repository> <parallel_count>")
+    print("Branch:           python PseudoGit.py branch <repository> <branch>")
+    print("Upload:           python PseudoGit.py upload <repository> <branch> <file_name>")
+    print("Create PR:        python PseudoGit.py create-pr <repository> <branch>")
+    print("List PR:          python PseudoGit.py list-pr <repository>")
+    print("Merge PR:         python PseudoGit.py merge-pr <repository> <pr_number>")
+
+if __name__ == "__main__":
+    validate_args(sys.argv)
+    
+    command = sys.argv[1]
+    repository = sys.argv[2]
+    
+    # Initialize optional parameters based on command
+    branch = None
+    file_name = None
+    pr_number = None
+    parallel_count = None
+    
+    if command == 'clone':
+        parallel_count = int(sys.argv[3])
+    elif command == 'branch':
+        branch = sys.argv[3]
+    elif command == 'upload':
+        branch = sys.argv[3]
+        file_name = sys.argv[4]
+    elif command == 'create-pr':
+        branch = sys.argv[3]
+    elif command == 'merge-pr':
+        pr_number = int(sys.argv[3])
+    
+    git_client = PseudoGit(command, repository, branch, file_name, pr_number, parallel_count)
+    if hasattr(git_client, command.replace('-', '_')):
+        getattr(git_client, command.replace('-', '_'))()
+    else:
+        print(f"Unknown command: {command}")
+""" 
+def main():
+    root = tk.Tk()
+    app = PseudoGitGUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
+"""
